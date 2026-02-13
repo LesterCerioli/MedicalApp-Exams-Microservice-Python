@@ -442,7 +442,7 @@ class AnalysisStatisticsResponse(BaseModel):
 # NOVOS SCHEMAS PARA OS ENDPOINTS REFATORADOS (SEM CAMPO 'token')
 # =============================================================================
 
-# ----- Exam Service: bodies para PATCH / DELETE / POST com path params -----
+
 
 class UpdateExamBody(BaseModel):
     """Corpo para PATCH /exams/{exam_id} (atualização parcial)"""
@@ -503,7 +503,7 @@ class BulkUpdateStatusBody(BaseModel):
         return v
 
 
-# ----- Exam Service: queries para GET (listagens) -----
+
 
 class OrganizationExamsQuery(BaseModel):
     """Query parameters para GET /exams/organization/{organization_name}"""
@@ -602,7 +602,6 @@ class ExamsWithoutPatientQuery(BaseModel):
     pass
 
 
-# ----- Exam Analysis Service: bodies para PATCH -----
 
 class UpdateExamAnalysisBody(BaseModel):
     """Corpo para PATCH /exam-analyses/{analysis_id}"""
@@ -620,7 +619,6 @@ class UpdateExamAnalysisBody(BaseModel):
         return v.strip() if v else v
 
 
-# ----- Exam Analysis Service: queries para GET (listagens) -----
 
 class OrganizationAnalysesQuery(BaseModel):
     """Query parameters para GET /exam-analyses/organization/{organization_name}"""

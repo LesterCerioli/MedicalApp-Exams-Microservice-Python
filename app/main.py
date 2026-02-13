@@ -1,3 +1,5 @@
+from typing import List
+from app import auth_service, exam_analysis_audit_service
 from fastapi import FastAPI, HTTPException, Depends, Header, Query, Path
 from datetime import date, datetime, timedelta
 import asyncio
@@ -22,14 +24,20 @@ from app.schemas import (  # NOTA: os schemas precisarão ser ajustados para REM
     AnalysesWithoutResultRequest,
     AnalysisStatisticsQuery,
     AnalysisStatisticsRequest,
+    AuditByDateRangeQuery,
+    AuditByOrganizationQuery,
+    AuditByUserQuery,
+    AuditForAnalysisQuery,
     AuthTokenRequest,
     CreateExamAnalysisRequest,
     DeleteExamAnalysisRequest,
+    ExamAnalysisAuditResponse,
     ExamCountsQuery,
     GetExamAnalysisRequest,
     OrganizationAnalysesQuery,
     OrganizationAnalysesRequest,
     OrganizationExamsQuery,
+    PaginatedAuditResponse,
     PatientExamsQuery,
     TokenValidationRequest,      # será removido posteriormente
     HealthCheckRequest,          # será removido
@@ -58,9 +66,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 app = FastAPI(
     title="Medical App - Exams Microservice",
-    description="API from Core microservice",
-    version="1.0.2",  # versão incrementada
-    author="Lucas Technology Service",
+    description="API from Exams Microservice",
 )
 
 # -----------------------------------------------------------------------------
@@ -688,7 +694,7 @@ async def get_organization_analyses(
 ):
     """List exam analyses for an organization with filters."""
     try:
-        # Define datas padrão (últimos 30 dias) se não informadas
+        
         end_date = query.end_date or datetime.utcnow()
         start_date = query.start_date or (end_date - timedelta(days=30))
 
@@ -755,6 +761,97 @@ async def get_analysis_statistics(
         return stats
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/audit/organization/{organization_name}", response_model=PaginatedAuditResponse, tags=["exam-audits"])
+async def get_audit_by_organization(
+    organization_name: str,
+    query: AuditByOrganizationQuery = Depends(),
+    token: str = Header(..., alias="Authorization")
+):
+    """
+    Returns audit records filtered by organization.
+    - **organization_name**: name of the organization (e.g., "Hospital São Paulo")
+    - **start_date**: start date/time (optional)
+    - **end_date**: end date/time (optional)
+    - **action_type**: action type (INSERT, UPDATE, DELETE)
+    - **page**: page number (default 1)
+    - **page_size**: items per page (default 50)
+    """
+    await auth_service.validate_token(token)
+    result = await exam_analysis_audit_service.get_audit_by_organization(
+        organization_name=organization_name,
+        start_date=query.start_date,
+        end_date=query.end_date,
+        action_type=query.action_type,
+        page=query.page,
+        page_size=query.page_size
+    )
+    return result
+
+
+@app.get("/audit/user/{db_user}", response_model=List[ExamAnalysisAuditResponse], tags=["exam-audits"])
+async def get_audit_by_user(
+    db_user: str,
+    query: AuditByUserQuery = Depends(),
+    token: str = Header(..., alias="Authorization")
+):
+    """
+    Returns audit records performed by a specific database user.
+    - **db_user**: database username (e.g., "app_user")
+    - **limit**: maximum number of records (default 100)
+    - **offset**: pagination offset
+    """
+    await auth_service.validate_token(token)
+    audits = await exam_analysis_audit_service.get_audit_by_user(
+        db_user=db_user,
+        limit=query.limit,
+        offset=query.offset
+    )
+    return audits
+
+
+@app.get("/audit/date-range", response_model=PaginatedAuditResponse, tags=["exam-audits"])
+async def get_audit_by_date_range(
+    query: AuditByDateRangeQuery = Depends(),
+    token: str = Header(..., alias="Authorization")
+):
+    """
+    Returns audit records within a required date range.
+    - **start_date**: start date/time
+    - **end_date**: end date/time
+    - **page**: page number
+    - **page_size**: items per page
+    """
+    await auth_service.validate_token(token)
+    result = await exam_analysis_audit_service.get_audit_by_date_range(
+        start_date=query.start_date,
+        end_date=query.end_date,
+        page=query.page,
+        page_size=query.page_size
+    )
+    return result
+# =============================================================================
+# Rotas de Auditoria
+# =============================================================================
+@app.get("/audit/analysis/{analysis_id}", response_model=List[ExamAnalysisAuditResponse], tags=["exam-audits"])
+async def get_audit_for_analysis(
+    analysis_id: UUID,
+    query: AuditForAnalysisQuery = Depends(),
+    token: str = Header(..., alias="Authorization")
+):
+    """
+    Retorna o histórico de auditoria para uma análise específica.
+    - **analysis_id**: UUID da análise
+    - **limit**: máximo de registros (padrão 100)
+    - **offset**: deslocamento para paginação
+    """
+    await auth_service.validate_token(token)
+    audits = await exam_analysis_audit_service.get_audit_for_analysis(
+        analysis_id=analysis_id,
+        limit=query.limit,
+        offset=query.offset
+    )
+    return audits
 
 # =============================================================================
 # MONITORING ENDPOINTS (agora GET com token no header)

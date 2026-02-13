@@ -1,0 +1,54 @@
+
+# Medical App Exams
+
+**Medical App Exams** is a robust microservice designed to manage laboratory test results. Part of the broader **Medical App** ecosystem, this service handles the registration of exam data and provides a secure way for patients to download their results.
+
+Built with performance and scalability in mind, it follows the best practices for independent microservices development.
+
+## 🚀 Technologies
+
+* **Python 3.12**: The latest features for high-performance backend logic.
+* **FastAPI**: Modern, fast (high-performance) web framework for building APIs.
+* **PostgreSQL (AWS)**: Relational database hosted on AWS, utilizing **advanced SQL queries** for optimized data retrieval.
+* **Docker**: Fully containerized application for consistent deployment.
+
+## 🛠️ Key Features
+
+* **Result Registration**: Secure endpoints to input laboratory exam data.
+* **Result Download**: Streamlined process for patients to access and download their medical reports.
+* **Independent Architecture**: Designed to operate autonomously within a microservices ecosystem.
+* **Advanced Data Handling**: Optimized PostgreSQL queries to ensure speed even with complex datasets.
+
+## 🏗️ Architecture & Best Practices
+
+This project adheres to industry-standard microservices principles:
+
+* **Single Responsibility**: Focused exclusively on exam management.
+* **Independence**: Decoupled from other services for easy scaling and maintenance.
+* **Containerization**: Ready for orchestration (like Kubernetes) via Docker.
+
+## 📦 How to Run
+
+1. **Clone the repository**:
+```bash
+git clone https://github.com/your-username/medical-app-exams.git
+
+```
+
+
+2. **Set up environment variables**:
+Configure your AWS PostgreSQL credentials in a `.env` file.
+3. **Run with Docker**:
+```bash
+docker-compose up --build
+
+```
+
+
+
+## ✒️ Authorship & Contributions
+
+This project is an **exclusive contribution by Lester Cerioli**.
+
+---
+

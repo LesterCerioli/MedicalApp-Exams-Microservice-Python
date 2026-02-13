@@ -40,9 +40,17 @@ git clone https://github.com/your-username/medical-app-exams.git
 Configure your AWS PostgreSQL credentials in a `.env` file.
 3. **Run with Docker**:
 ```bash
-docker-compose up --build
+docker build -t medical-app-exams .
+docker run -p 8000:8000 medical-app-exams
 
 ```
+4. Alternative:
+   Run:
+   
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+   
 
 
 

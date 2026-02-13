@@ -710,3 +710,80 @@ class AnalysisStatisticsQuery(BaseModel):
         if v is not None and info.data.get('start_date') and v < info.data['start_date']:
             raise ValueError("end_date must be >= start_date")
         return v
+    
+    
+# =============================================================================
+# Exam Analysis Audit Service - Schemas
+# =============================================================================
+
+class ExamAnalysisAuditResponse(BaseModel):
+    """Schema para um registro de auditoria de análise de exame"""
+    id: UUID
+    exam_analyses_id: UUID
+    action_type: str  # INSERT, UPDATE, DELETE
+    old_data: Optional[Dict[str, Any]] = None
+    new_data: Optional[Dict[str, Any]] = None
+    changed_fields: Optional[List[List[str]]] = None  # array de [campo, valor_antigo, valor_novo]
+    application_name: Optional[str] = None
+    db_user: Optional[str] = None
+    changed_at: datetime
+    # Campos adicionais quando há JOIN com exam_analyses (opcionais)
+    exam_type: Optional[str] = None
+    organizations_id: Optional[UUID] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PaginatedAuditResponse(BaseModel):
+    """Resposta paginada para listagens de auditoria"""
+    audits: List[ExamAnalysisAuditResponse]
+    total_count: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+# ----- Query Parameters para endpoints GET -----
+
+class AuditForAnalysisQuery(BaseModel):
+    """Query parameters para GET /audit/analysis/{analysis_id}"""
+    limit: int = Field(100, ge=1, le=1000, description="Número máximo de registros")
+    offset: int = Field(0, ge=0, description="Deslocamento para paginação")
+
+
+class AuditByOrganizationQuery(BaseModel):
+    """Query parameters para GET /audit/organization/{organization_name}"""
+    start_date: Optional[datetime] = Field(None, description="Data/hora inicial (inclusive)")
+    end_date: Optional[datetime] = Field(None, description="Data/hora final (inclusive)")
+    action_type: Optional[str] = Field(None, description="Filtrar por tipo de ação (INSERT, UPDATE, DELETE)")
+    page: int = Field(1, ge=1, description="Número da página")
+    page_size: int = Field(50, ge=1, le=100, description="Itens por página")
+
+    @field_validator('end_date')
+    @classmethod
+    def validate_date_range(cls, v: Optional[datetime], info: ValidationInfo) -> Optional[datetime]:
+        if v is not None and info.data.get('start_date') and v < info.data['start_date']:
+            raise ValueError("end_date must be >= start_date")
+        return v
+
+
+class AuditByUserQuery(BaseModel):
+    """Query parameters para GET /audit/user/{db_user}"""
+    limit: int = Field(100, ge=1, le=1000, description="Número máximo de registros")
+    offset: int = Field(0, ge=0, description="Deslocamento para paginação")
+
+
+class AuditByDateRangeQuery(BaseModel):
+    """Query parameters para GET /audit/date-range"""
+    start_date: datetime = Field(..., description="Data/hora inicial (obrigatório)")
+    end_date: datetime = Field(..., description="Data/hora final (obrigatório)")
+    page: int = Field(1, ge=1, description="Número da página")
+    page_size: int = Field(50, ge=1, le=100, description="Itens por página")
+
+    @field_validator('end_date')
+    @classmethod
+    def validate_date_range(cls, v: datetime, info: ValidationInfo) -> datetime:
+        if v < info.data.get('start_date'):
+            raise ValueError("end_date must be >= start_date")
+        return v

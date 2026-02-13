@@ -1,419 +1,806 @@
-from fastapi import FastAPI, HTTPException, Depends, Query, status
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Depends, Header, Query, Path
+from datetime import date, datetime, timedelta
+import asyncio
+import logging
+from typing import Dict, Any, Optional
 from uuid import UUID
-from datetime import datetime
 
+
+import jwt
+from app import exam_analysis_service
+from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+
+from app.auth_service import auth_token_service
 from app.database import db
-from app.services.exam_scheduling_service import exam_scheduling_service
-from app.schemas import (
-    ExamSchedulingCreate,
-    ExamSchedulingUpdate,
-    ExamSchedulingResponse,
-    ExamStatisticsResponse,
-    SecureAccessRequest,
-    ExamListRequest
+from app.exam_service import exam_service
+from app.schemas import (  # NOTA: os schemas precisarão ser ajustados para REMOVER o campo 'token'
+    AnalysesByTypeQuery,
+    AnalysesByTypeRequest,
+    AnalysesWithoutResultQuery,
+    AnalysesWithoutResultRequest,
+    AnalysisStatisticsQuery,
+    AnalysisStatisticsRequest,
+    AuthTokenRequest,
+    CreateExamAnalysisRequest,
+    DeleteExamAnalysisRequest,
+    ExamCountsQuery,
+    GetExamAnalysisRequest,
+    OrganizationAnalysesQuery,
+    OrganizationAnalysesRequest,
+    OrganizationExamsQuery,
+    PatientExamsQuery,
+    TokenValidationRequest,      # será removido posteriormente
+    HealthCheckRequest,          # será removido
+    RootRequest,                # será removido
+    CreateExamRequest,
+    GetExamRequest,
+    UpcomingExamsQuery,
+    UpdateExamAnalysisBody,
+    UpdateExamAnalysisRequest,
+    UpdateExamRequest,
+    DeleteExamRequest,
+    RestoreExamRequest,
+    OrganizationExamsRequest,
+    PatientExamsRequest,
+    UpdateExamStatusRequest,
+    BulkUpdateStatusRequest,
+    ExamCountsRequest,
+    UpcomingExamsRequest,
+    ExamsWithoutPatientRequest,
 )
 
-# Initialize FastAPI app
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------------
+# FastAPI app initialization
+# -----------------------------------------------------------------------------
 app = FastAPI(
-    title="Medical Exam API",
-    description="API for Medical exams",
-    version="1.0.1",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    title="Medical App - Exams Microservice",
+    description="API from Core microservice",
+    version="1.0.2",  # versão incrementada
+    author="Lucas Technology Service",
 )
 
+# -----------------------------------------------------------------------------
 # CORS middleware
+# -----------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  
+    allow_origins=["https://lts-us-website.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -----------------------------------------------------------------------------
+# Event handlers
+# -----------------------------------------------------------------------------
 @app.on_event("startup")
 async def startup_event():
-    """Initialize database connections on startup"""
-    print("INFO: Medical Exam Scheduling API starting up...")
-    
+    db.init_db()
+    logger.info("Database initialized")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Clean up on shutdown"""
-    print("INFO: Medical Exam Scheduling API shutting down...")
+    logger.info("Exam service stopped")
 
-@app.get("/health", status_code=status.HTTP_200_OK)
-async def health_check():
-    """Health check endpoint"""
+# -----------------------------------------------------------------------------
+# JWT token validation dependency (HEADER only)
+# -----------------------------------------------------------------------------
+async def get_token_data_from_header(authorization: str = Header(...)) -> Dict[str, Any]:
+    """
+    Extrai e valida o token JWT do header Authorization: Bearer <token>.
+    Retorna os dados decodificados do token.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+
     try:
-        # Test database connection
-        with db.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT 1")
-                result = cursor.fetchone()
-        
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer":
+            raise HTTPException(status_code=401, detail="Invalid authentication scheme")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid authorization header format")
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Token is required")
+
+    if not auth_token_service.validate_token(token):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    try:
+        decoded_token = jwt.decode(
+            token,
+            auth_token_service.jwt_secret,
+            algorithms=["HS256"]
+        )
         return {
-            "status": "healthy",
-            "service": "exam-scheduling-api",
-            "database": "connected",
-            "timestamp": datetime.now().isoformat()
+            "client_id": decoded_token.get("client_id"),
+            "token": token,
         }
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Database connection failed: {str(e)}"
+            status_code=401,
+            detail=f"Token validation failed: {str(e)}"
         )
 
-# Root endpoint
-@app.get("/", status_code=status.HTTP_200_OK)
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "Medical Exam Scheduling API",
-        "version": "1.0.0",
-        "endpoints": {
-            "docs": "/docs",
-            "health": "/health",
-            "create_exam": "POST /exams/",
-            "get_exam": "GET /exams/{secure_identifier}",
-            "update_exam": "PUT /exams/{secure_identifier}",
-            "delete_exam": "DELETE /exams/{secure_identifier}",
-            "list_exams": "GET /exams/",
-            "upcoming_exams": "GET /exams/upcoming/",
-            "statistics": "GET /exams/statistics/"
+# -----------------------------------------------------------------------------
+# Função auxiliar para manter compatibilidade durante migração (pode ser removida depois)
+# -----------------------------------------------------------------------------
+async def validate_token_from_body(token: str) -> Dict[str, Any]:
+    """DEPRECATED: use get_token_data_from_header instead."""
+    return await get_token_data_from_header(f"Bearer {token}")
+
+# =============================================================================
+# AUTHENTICATION ENDPOINTS
+# =============================================================================
+
+@app.post("/auth/token", tags=["auth"])
+async def generate_auth_token(auth_request: AuthTokenRequest):
+    """
+    Generate JWT authentication token.
+    - **client_id**: Client identifier
+    - **client_secret**: Client secret
+    """
+    try:
+        if not auth_request.client_id or not auth_request.client_secret:
+            raise HTTPException(
+                status_code=400,
+                detail="Both 'client_id' and 'client_secret' are required"
+            )
+        result = auth_token_service.generate_token(
+            auth_request.client_id,
+            auth_request.client_secret
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+@app.post("/auth/validate", tags=["auth"])
+async def validate_auth_token(
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Validate JWT authentication token.
+    Token must be sent in Authorization header: Bearer <token>
+    """
+    return {"valid": True, "message": "Token is valid", "client_id": token_data["client_id"]}
+
+@app.get("/auth/token/{client_id}", tags=["auth"])
+async def get_valid_token(client_id: str):
+    """Get valid token for client_id (if any). This endpoint is public."""
+    token = auth_token_service.get_valid_token(client_id)
+    if not token:
+        raise HTTPException(status_code=404, detail="No valid token found")
+    return {"token": token}
+
+@app.delete("/auth/cleanup", tags=["auth"])
+async def cleanup_tokens(
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Clean up expired tokens (admin endpoint).
+    Requires valid JWT token in Authorization header.
+    """
+    # Aqui você pode adicionar verificação de permissão de admin se necessário
+    deleted_count = auth_token_service.cleanup_expired_tokens()
+    return {"message": f"Cleaned up {deleted_count} expired tokens"}
+
+# =============================================================================
+# EXAMS ENDPOINTS
+# =============================================================================
+
+@app.post("/exams/create", tags=["exams"])
+async def create_exam(
+    request: CreateExamRequest,  # ATENÇÃO: remova o campo 'token' deste schema!
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Create a new medical exam.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        result = await exam_service.create_exam(
+            organization_name=request.organization_name,
+            exam_type=request.exam_type,
+            patient_name=request.patient_name,
+            status=request.status,
+            requested_at=request.requested_at,
+            notes=request.notes,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exams/get", tags=["exams"])
+async def get_exam(
+    request: GetExamRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Retrieve a medical exam by its ID.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        exam = await exam_service.get_exam_by_id(request.exam_id)
+        if not exam:
+            raise HTTPException(status_code=404, detail="Exam not found")
+        return exam
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+
+@app.delete("/exams/delete", tags=["exams"])
+async def delete_exam(
+    request: DeleteExamRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Soft delete a medical exam.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        success = await exam_service.delete_exam(request.exam_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Exam not found or already deleted")
+        return {"success": True, "message": "Exam deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/exams/restore", tags=["exams"])
+async def restore_exam(
+    request: RestoreExamRequest,  
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Restore a soft‑deleted medical exam.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        restored = await exam_service.restore_exam(request.exam_id)
+        if not restored:
+            raise HTTPException(status_code=404, detail="Exam not found or not deleted")
+        return restored
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exams/organization", tags=["exams"])
+async def get_organization_exams(
+    request: OrganizationExamsRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    List exams for a specific organization with optional filters and pagination.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        result = await exam_service.get_organization_exams(
+            organization_id=request.organization_id,
+            patient_id=request.patient_id,
+            status=request.status,
+            exam_type=request.exam_type,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            page=request.page,
+            page_size=request.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exams/patient", tags=["exams"])
+async def get_patient_exams(
+    request: PatientExamsRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    List exams for a specific patient with optional filters and pagination.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        result = await exam_service.get_patient_exams(
+            patient_id=request.patient_id,
+            organization_id=request.organization_id,
+            status=request.status,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            page=request.page,
+            page_size=request.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/exams/status", tags=["exams"])
+async def update_exam_status(
+    request: UpdateExamStatusRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Update only the status of an exam.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        success = await exam_service.update_exam_status(request.exam_id, request.status)
+        if not success:
+            raise HTTPException(status_code=404, detail="Exam not found or already deleted")
+        return {"success": True, "message": f"Status updated to {request.status}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/exams/bulk-status", tags=["exams"])
+async def bulk_update_status(
+    request: BulkUpdateStatusRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Update the status of multiple exams at once.
+    Returns the number of successfully updated exams.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        updated_count = await exam_service.bulk_update_status(
+            exam_ids=request.exam_ids,
+            status=request.status,
+        )
+        return {
+            "success": True,
+            "updated_count": updated_count,
+            "message": f"Updated {updated_count} exams to status {request.status}",
         }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exams/counts-by-status", tags=["exams"])
+async def get_exam_counts_by_status(
+    request: ExamCountsRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Get count of exams grouped by status for an organization,
+    optionally filtered by date range.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        counts = await exam_service.get_exam_counts_by_status(
+            organization_id=request.organization_id,
+            start_date=request.start_date,
+            end_date=request.end_date,
+        )
+        return counts
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exams/upcoming", tags=["exams"])
+async def get_upcoming_exams(
+    request: UpcomingExamsRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Fetch exams scheduled within a date range (typically upcoming).
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        result = await exam_service.get_upcoming_exams(
+            organization_id=request.organization_id,
+            from_date=request.from_date,
+            to_date=request.to_date,
+            page=request.page,
+            page_size=request.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exams/without-patient", tags=["exams"])
+async def get_exams_without_patient(
+    request: ExamsWithoutPatientRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Fetch all exams for an organization that are not associated with any patient.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        exams = await exam_service.get_exams_without_patient(request.organization_id)
+        return {"exams": exams, "count": len(exams)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/exams/organization/{organization_name}", tags=["exams"])
+async def get_organization_exams(
+    organization_name: str = Path(...),
+    query: OrganizationExamsQuery = Depends(),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """List exams for an organization with filters."""
+    try:
+        result = await exam_service.get_organization_exams(
+            organization_name=organization_name,
+            patient_name=query.patient_name,
+            status=query.status,
+            exam_type=query.exam_type,
+            start_date=query.start_date,
+            end_date=query.end_date,
+            page=query.page,
+            page_size=query.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/exams/patient", tags=["exams"])
+async def get_patient_exams(
+    query: PatientExamsQuery = Depends(),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """List exams for a patient with filters."""
+    try:
+        result = await exam_service.get_patient_exams(
+            patient_name=query.patient_name,  # ajuste conforme serviço
+            organization_name=query.organization_name,
+            status=query.status,
+            start_date=query.start_date,
+            end_date=query.end_date,
+            page=query.page,
+            page_size=query.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+
+@app.get("/exams/counts-by-status", tags=["exams"])
+async def get_exam_counts_by_status(
+    organization_name: str = Query(...),
+    query: ExamCountsQuery = Depends(),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """Get exam counts grouped by status."""
+    try:
+        counts = await exam_service.get_exam_counts_by_status(
+            organization_name=organization_name,
+            start_date=query.start_date,
+            end_date=query.end_date,
+        )
+        return counts
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/exams/upcoming", tags=["exams"])
+async def get_upcoming_exams(
+    organization_name: str = Query(...),
+    query: UpcomingExamsQuery = Depends(),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """Fetch exams scheduled within a date range."""
+    try:
+        result = await exam_service.get_upcoming_exams(
+            organization_name=organization_name,
+            from_date=query.from_date,
+            to_date=query.to_date,
+            page=query.page,
+            page_size=query.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# =============================================================================
+# EXAM ANALYSIS ENDPOINTS
+# =============================================================================
+
+@app.post("/exam-analyses/create", tags=["exam-analyses"])
+async def create_exam_analysis(
+    request: CreateExamAnalysisRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Create a new exam analysis record.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        result = await exam_analysis_service.create_exam_analysis(
+            organization_name=request.organization_name,
+            exam_type=request.exam_type,
+            original_results=request.original_results,
+            exam_date=request.exam_date,
+            exam_result=request.exam_result,
+            observations=request.observations,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/exam-analyses/update", tags=["exam-analyses"])
+async def update_exam_analysis(
+    request: UpdateExamAnalysisRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Update an existing exam analysis.
+    Only fields with non-None values will be updated.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        updated = await exam_analysis_service.update_exam_analysis(
+            analysis_id=request.analysis_id,
+            exam_type=request.exam_type,
+            exam_date=request.exam_date,
+            original_results=request.original_results,
+            exam_result=request.exam_result,
+            observations=request.observations,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Exam analysis not found")
+        return updated
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/exam-analyses/delete", tags=["exam-analyses"])
+async def delete_exam_analysis(
+    request: DeleteExamAnalysisRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Permanently delete an exam analysis.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        success = await exam_analysis_service.delete_exam_analysis(request.analysis_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Exam analysis not found")
+        return {"success": True, "message": "Exam analysis deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/exam-analyses/{analysis_id}", tags=["exam-analyses"])
+async def get_exam_analysis(
+    analysis_id: UUID = Path(...),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """Retrieve an exam analysis by ID."""
+    try:
+        analysis = await exam_analysis_service.get_exam_analysis_by_id(analysis_id)
+        if not analysis:
+            raise HTTPException(status_code=404, detail="Exam analysis not found")
+        return analysis
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.patch("/exam-analyses/{analysis_id}", tags=["exam-analyses"])
+async def update_exam_analysis(
+    analysis_id: UUID = Path(...),
+    body: UpdateExamAnalysisBody = None,
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """Partially update an exam analysis."""
+    try:
+        updated = await exam_analysis_service.update_exam_analysis(
+            analysis_id=analysis_id,
+            exam_type=body.exam_type,
+            exam_date=body.exam_date,
+            original_results=body.original_results,
+            exam_result=body.exam_result,
+            observations=body.observations,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Exam analysis not found")
+        return updated
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/exam-analyses/{analysis_id}", tags=["exam-analyses"])
+async def delete_exam_analysis(
+    analysis_id: UUID = Path(...),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """Permanently delete an exam analysis."""
+    try:
+        success = await exam_analysis_service.delete_exam_analysis(analysis_id)
+        if not success:
+            raise HTTPException(status_code=404, detail="Exam analysis not found")
+        return {"success": True, "message": "Exam analysis deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/exam-analyses/organization", tags=["exam-analyses"])
+async def get_organization_analyses(
+    request: OrganizationAnalysesRequest,  
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    List exam analyses for a specific organization with optional filters and pagination.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        # Aplica datas padrão se não informadas
+        if request.end_date is None:
+            request.end_date = datetime.utcnow()
+        if request.start_date is None:
+            request.start_date = request.end_date - timedelta(days=30)
+
+        result = await exam_analysis_service.get_organization_analyses(
+            organization_name=request.organization_name,
+            exam_type=request.exam_type,
+            start_date=request.start_date,
+            end_date=request.end_date,
+            page=request.page,
+            page_size=request.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/exam-analyses/without-result", tags=["exam-analyses"])
+async def get_analyses_without_exam_result(
+    request: AnalysesWithoutResultRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    List exam analyses for an organization that do not have an exam_result yet.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        result = await exam_analysis_service.get_analyses_without_exam_result(
+            organization_name=request.organization_name,
+            page=request.page,
+            page_size=request.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/exam-analyses/by-type", tags=["exam-analyses"])
+async def get_analyses_by_exam_type(
+    request: AnalysesByTypeRequest,  # remova o campo 'token'
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    List exam analyses filtered by exact exam type.
+    Authentication: Bearer token in Authorization header.
+    """
+    try:
+        result = await exam_analysis_service.get_analyses_by_exam_type(
+            organization_name=request.organization_name,
+            exam_type=request.exam_type,
+            page=request.page,
+            page_size=request.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exam-analyses/organization/{organization_name}", tags=["exam-analyses"])
+async def get_organization_analyses(
+    organization_name: str = Path(...),
+    query: OrganizationAnalysesQuery = Depends(),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """List exam analyses for an organization with filters."""
+    try:
+        # Define datas padrão (últimos 30 dias) se não informadas
+        end_date = query.end_date or datetime.utcnow()
+        start_date = query.start_date or (end_date - timedelta(days=30))
+
+        result = await exam_analysis_service.get_organization_analyses(
+            organization_name=organization_name,
+            exam_type=query.exam_type,
+            start_date=start_date,
+            end_date=end_date,
+            page=query.page,
+            page_size=query.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exam-analyses/without-result", tags=["exam-analyses"])
+async def get_analyses_without_exam_result(
+    organization_name: str = Query(...),
+    query: AnalysesWithoutResultQuery = Depends(),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """List exam analyses that do not have an exam_result yet."""
+    try:
+        result = await exam_analysis_service.get_analyses_without_exam_result(
+            organization_name=organization_name,
+            page=query.page,
+            page_size=query.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exam-analyses/by-type", tags=["exam-analyses"])
+async def get_analyses_by_exam_type(
+    organization_name: str = Query(...),
+    query: AnalysesByTypeQuery = Depends(),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """List exam analyses filtered by exact exam type."""
+    try:
+        result = await exam_analysis_service.get_analyses_by_exam_type(
+            organization_name=organization_name,
+            exam_type=query.exam_type,
+            page=query.page,
+            page_size=query.page_size,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/exam-analyses/statistics", tags=["exam-analyses"])
+async def get_analysis_statistics(
+    organization_name: str = Query(...),
+    query: AnalysisStatisticsQuery = Depends(),
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """Return statistics about exam analyses for an organization."""
+    try:
+        stats = await exam_analysis_service.get_analysis_statistics(
+            organization_name=organization_name,
+            start_date=query.start_date,
+            end_date=query.end_date,
+        )
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# =============================================================================
+# MONITORING ENDPOINTS (agora GET com token no header)
+# =============================================================================
+
+@app.get("/health", tags=["monitoring"])
+async def health_check(
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
+):
+    """
+    Health check endpoint.
+    Authentication: Bearer token in Authorization header.
+    """
+    return {
+        "status": "healthy",
+        "service": "exam-microservice",
+        "version": "1.0.2",
+        "authenticated_client": token_data["client_id"],
     }
 
-# Exam Scheduling Endpoints
-
-@app.post("/exams/", 
-          response_model=ExamSchedulingResponse, 
-          status_code=status.HTTP_201_CREATED,
-          summary="Create a new exam scheduling",
-          description="Create a new exam scheduling record with secure data handling")
-async def create_exam_scheduling(exam_data: ExamSchedulingCreate):
-    """
-    Create a new exam scheduling.
-    
-    - **organization_id**: Internal UUID of the organization (not exposed in response)
-    - **patient_id**: Internal UUID of the patient (optional, not exposed in response)
-    - **exam_name**: Name of the exam (used as secure identifier)
-    - **scheduled_date**: Date and time when the exam is scheduled
-    - **status**: Current status of the exam (default: scheduled)
-    """
-    try:
-        print(f"DEBUG: Creating exam scheduling for organization: {exam_data.organization_id}")
-        
-        # Convert Pydantic model to dict for service processing
-        exam_dict = exam_data.dict()
-        
-        result = exam_scheduling_service.create_exam_scheduling(exam_dict)
-        
-        if not result:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Failed to create exam scheduling. Organization may not exist or exam name might be duplicate."
-            )
-        
-        return ExamSchedulingResponse(**result)
-        
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    except Exception as e:
-        print(f"ERROR: Unexpected error creating exam: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error occurred while creating exam scheduling"
-        )
-
-@app.get("/exams/{exam_name}", 
-         response_model=ExamSchedulingResponse,
-         summary="Get exam by secure identifier",
-         description="Retrieve exam scheduling details using exam name and organization name as secure identifiers")
-async def get_exam_scheduling(
-    exam_name: str,
-    organization_name: str = Query(..., description="Organization name for secure access"),
-    patient_name: Optional[str] = Query(None, description="Optional patient name for additional verification")
+@app.get("/", tags=["monitoring"])
+async def root(
+    token_data: Dict[str, Any] = Depends(get_token_data_from_header)
 ):
     """
-    Get exam scheduling details by secure identifier.
-    
-    - **exam_name**: Name of the exam (acts as secure identifier)
-    - **organization_name**: Name of the organization (required for access control)
-    - **patient_name**: Optional patient name for additional verification
+    Root endpoint with API information.
+    Authentication: Bearer token in Authorization header.
     """
-    try:
-        print(f"DEBUG: Fetching exam: '{exam_name}' for organization: '{organization_name}'")
-        
-        # Verify access first
-        if not exam_scheduling_service.verify_exam_access(exam_name, organization_name, patient_name):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Exam not found or access denied"
-            )
-        
-        exam = exam_scheduling_service.get_exam_by_secure_identifier(exam_name, organization_name)
-        
-        if not exam:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Exam scheduling not found"
-            )
-        
-        return ExamSchedulingResponse(**exam)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR: Unexpected error fetching exam: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error occurred while fetching exam scheduling"
-        )
+    return {
+        "message": "Exam Microservice API",
+        "version": "1.0.2",
+        "docs": "/docs",
+        "redoc": "/redoc",
+        "authenticated_client": token_data["client_id"],
+    }
 
-@app.put("/exams/{exam_name}",
-         response_model=ExamSchedulingResponse,
-         summary="Update exam scheduling",
-         description="Update exam scheduling details using secure identifiers")
-async def update_exam_scheduling(
-    exam_name: str,
-    update_data: ExamSchedulingUpdate,
-    organization_name: str = Query(..., description="Organization name for secure access")
-):
-    """
-    Update exam scheduling details.
-    
-    - **exam_name**: Name of the exam to update
-    - **organization_name**: Organization name for verification
-    - **update_data**: Fields to update (only provided fields will be updated)
-    """
-    try:
-        print(f"DEBUG: Updating exam: '{exam_name}' for organization: '{organization_name}'")
-        
-        # Convert Pydantic model to dict
-        update_dict = update_data.dict(exclude_unset=True)
-        
-        result = exam_scheduling_service.update_exam_scheduling(
-            exam_name, 
-            organization_name, 
-            update_dict
-        )
-        
-        if not result:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Exam scheduling not found or update failed"
-            )
-        
-        return ExamSchedulingResponse(**result)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR: Unexpected error updating exam: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error occurred while updating exam scheduling"
-        )
+# =============================================================================
+# DOCUMENTATION ENDPOINTS (public, sem autenticação)
+# =============================================================================
 
-@app.delete("/exams/{exam_name}",
-            status_code=status.HTTP_200_OK,
-            summary="Delete exam scheduling",
-            description="Soft delete exam scheduling using secure identifiers")
-async def delete_exam_scheduling(
-    exam_name: str,
-    organization_name: str = Query(..., description="Organization name for secure access")
-):
-    """
-    Delete exam scheduling (soft delete).
-    
-    - **exam_name**: Name of the exam to delete
-    - **organization_name**: Organization name for verification
-    """
-    try:
-        print(f"DEBUG: Deleting exam: '{exam_name}' for organization: '{organization_name}'")
-        
-        success = exam_scheduling_service.delete_exam_scheduling(exam_name, organization_name)
-        
-        if not success:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Exam scheduling not found or already deleted"
-            )
-        
-        return {
-            "message": "Exam scheduling deleted successfully",
-            "exam_name": exam_name,
-            "organization": organization_name
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR: Unexpected error deleting exam: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error occurred while deleting exam scheduling"
-        )
+@app.get("/docs", include_in_schema=False)
+async def get_docs():
+    """Redirect to Swagger UI documentation."""
+    return RedirectResponse(url="/docs")
 
-@app.get("/exams/",
-         response_model=List[ExamSchedulingResponse],
-         summary="List exams by organization",
-         description="List all exam schedules for an organization with pagination")
-async def list_exam_schedules(
-    organization_name: str = Query(..., description="Organization name to filter exams"),
-    page: int = Query(1, ge=1, description="Page number for pagination"),
-    page_size: int = Query(10, ge=1, le=100, description="Number of items per page"),
-    status: Optional[str] = Query(None, description="Filter by exam status")
-):
-    """
-    List exam schedules for an organization.
-    
-    - **organization_name**: Name of the organization
-    - **page**: Page number (default: 1)
-    - **page_size**: Items per page (default: 10, max: 100)
-    - **status**: Filter by status (scheduled, in-progress, completed, cancelled, postponed)
-    """
-    try:
-        print(f"DEBUG: Listing exams for organization: '{organization_name}', page: {page}, status: {status}")
-        
-        exams = exam_scheduling_service.list_exams_by_organization(
-            organization_name, page, page_size, status
-        )
-        
-        return [ExamSchedulingResponse(**exam) for exam in exams]
-        
-    except Exception as e:
-        print(f"ERROR: Unexpected error listing exams: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error occurred while listing exam schedules"
-        )
-
-@app.get("/exams/upcoming/",
-         response_model=List[ExamSchedulingResponse],
-         summary="Get upcoming exams",
-         description="Get exams scheduled within the next specified hours")
-async def get_upcoming_exams(
-    organization_name: str = Query(..., description="Organization name"),
-    hours_ahead: int = Query(24, ge=1, le=168, description="Hours ahead to look for exams (1-168)")
-):
-    """
-    Get upcoming exams within the next specified hours.
-    
-    - **organization_name**: Name of the organization
-    - **hours_ahead**: Number of hours to look ahead (default: 24, max: 168 (1 week))
-    """
-    try:
-        print(f"DEBUG: Getting upcoming exams for organization: '{organization_name}', hours: {hours_ahead}")
-        
-        exams = exam_scheduling_service.get_upcoming_exams_secure(organization_name, hours_ahead)
-        
-        return [ExamSchedulingResponse(**exam) for exam in exams]
-        
-    except Exception as e:
-        print(f"ERROR: Unexpected error fetching upcoming exams: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error occurred while fetching upcoming exams"
-        )
-
-@app.get("/exams/statistics/",
-         response_model=ExamStatisticsResponse,
-         summary="Get exam statistics",
-         description="Get statistics for exams in an organization")
-async def get_exam_statistics(
-    organization_name: str = Query(..., description="Organization name")
-):
-    """
-    Get exam statistics for an organization.
-    
-    - **organization_name**: Name of the organization
-    """
-    try:
-        print(f"DEBUG: Getting statistics for organization: '{organization_name}'")
-        
-        stats = exam_scheduling_service.get_exam_statistics(organization_name)
-        
-        if not stats:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Organization not found or no exam data available"
-            )
-        
-        return ExamStatisticsResponse(**stats)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"ERROR: Unexpected error fetching statistics: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error occurred while fetching exam statistics"
-        )
-
-@app.post("/exams/verify-access/",
-          status_code=status.HTTP_200_OK,
-          summary="Verify exam access",
-          description="Verify if the current user has access to a specific exam")
-async def verify_exam_access(access_request: SecureAccessRequest):
-    """
-    Verify access to an exam scheduling record.
-    
-    - **exam_name**: Name of the exam
-    - **organization_name**: Name of the organization
-    """
-    try:
-        print(f"DEBUG: Verifying access for exam: '{access_request.exam_name}' in org: '{access_request.organization_name}'")
-        
-        has_access = exam_scheduling_service.verify_exam_access(
-            access_request.exam_name,
-            access_request.organization_name
-        )
-        
-        return {
-            "has_access": has_access,
-            "exam_name": access_request.exam_name,
-            "organization": access_request.organization_name
-        }
-        
-    except Exception as e:
-        print(f"ERROR: Unexpected error verifying access: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Internal server error occurred while verifying access"
-        )
-
-# Exception handlers
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
-    """Global HTTP exception handler"""
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail}
-    )
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """Global exception handler"""
-    print(f"ERROR: Unhandled exception: {exc}")
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "Internal server error"}
-    )
-
-if __name__ == "__main__":
-    import uvicorn
-    
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,  # Enable auto-reload in development
-        log_level="info"
-    )
+@app.get("/redoc", include_in_schema=False)
+async def get_redoc():
+    """Redirect to ReDoc documentation."""
+    return RedirectResponse(url="/redoc")

@@ -50,7 +50,18 @@ docker run -p 8000:8000 medical-app-exams
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-   
+
+
+
+<img width="1242" height="609" alt="image" src="https://github.com/user-attachments/assets/d893941a-1de1-40f2-bd02-0821858a8889" />
+
+
+<img width="1237" height="620" alt="image" src="https://github.com/user-attachments/assets/2616e28f-ba7c-4d9b-8b07-a168f0c2b4db" />
+
+<img width="1237" height="620" alt="image" src="https://github.com/user-attachments/assets/32e428a9-b7af-403b-975d-aabd51f67c6a" />
+
+<img width="1237" height="620" alt="image" src="https://github.com/user-attachments/assets/bf348e31-6699-44b7-b01e-5fc5825e4332" />
+
 
 
 

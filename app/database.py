@@ -1,27 +1,14 @@
+import asyncio
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 from app.config import config
 import contextlib
 import uuid
 
 class Database:
-    def __init__(self, database_type: str = 'primary'):
-        """
-        Initialize database connection for primary or secondary database.
-        
-        Args:
-            database_type: 'primary' for medical_db, 'secondary' for medical_dbx
-        """
-        self.database_type = database_type
-        self.connection_string = self._get_connection_string()
-    
-    def _get_connection_string(self) -> str:
-        """Get connection string based on database type"""
-        if self.database_type == 'secondary':
-            return config.DATABASE_URL_SECONDARY
-        else:
-            return config.DATABASE_URL
+    def __init__(self):
+        self.connection_string = config.DATABASE_URL
     
     @contextlib.contextmanager
     def get_connection(self):
@@ -37,6 +24,8 @@ class Database:
     
     def init_db(self):
         """Initializes the users table with proper constraints"""
+        # Como as tabelas já existem, este método pode ser simplificado
+        # ou até removido se não for necessário criar tabelas
         print("INFO: Database tables already exist, skipping table creation")
     
     def organization_exists(self, organization_name: str) -> bool:
@@ -61,7 +50,7 @@ class Database:
             
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Search with TRIM and case-insensitive
+                    # Busca com TRIM e case-insensitive
                     cursor.execute(
                         "SELECT id, name FROM public.organizations WHERE LOWER(TRIM(name)) = LOWER(TRIM(%s))",
                         (organization_name,)
@@ -72,7 +61,7 @@ class Database:
                         print(f"DEBUG: Organization found - ID: {result['id']}, Name: '{result['name']}'")
                         return result['id']
                     else:
-                        # List all organizations for debug
+                        # Listar todas as organizações para debug
                         cursor.execute("SELECT id, name FROM public.organizations")
                         all_orgs = cursor.fetchall()
                         print(f"DEBUG: Available organizations: {[dict(org) for org in all_orgs]}")
@@ -89,7 +78,7 @@ class Database:
             
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Generate UUID manually
+                    # Gera UUID manualmente
                     user_id = str(uuid.uuid4())
                     
                     cursor.execute('''
@@ -175,35 +164,44 @@ class Database:
             print(f"Error fetching organization users: {e}")
             return None
 
-    
-    def execute_query(self, query: str, params: tuple = None, fetch: bool = True) -> Optional[Union[List[Dict[str, Any]], bool]]:
-        """
-        Execute a custom SQL query on the database.
-        
-        Args:
-            query: SQL query to execute
-            params: Parameters for the query
-            fetch: Whether to fetch results or just execute
-            
-        Returns:
-            Query results if fetch=True, otherwise success status
-        """
+    @contextlib.asynccontextmanager
+    async def get_async_connection(self):
+        loop = asyncio.get_event_loop()
+        conn = await loop.run_in_executor(
+            None,
+            lambda: psycopg2.connect(
+                self.connection_string,
+                cursor_factory=RealDictCursor
+            )
+        )
         try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute(query, params or ())
-                    
-                    if fetch:
-                        results = cursor.fetchall()
-                        return [dict(result) for result in results]
-                    else:
-                        conn.commit()
-                        return True
-                        
-        except Exception as e:
-            print(f"Error executing query: {e}")
-            return None
+            yield conn
+        finally:
+            await loop.run_in_executor(None, conn.close)
+            
+    async def execute_query(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
+        async with self.get_async_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params or ())
+            results = cursor.fetchall()
+            conn.commit()
+            return [dict(row) for row in results] if results else []
+        
+    async def execute_update(self, query: str, params: tuple = None) -> bool:
+        async with self.get_async_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params or ())
+            conn.commit()
+            return cursor.rowcount > 0
+        
+    async def fetch_one(self, query: str, params: tuple = None) -> Optional[Dict[str, Any]]:
+        async with self.get_async_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params or ())
+            result = cursor.fetchone()
+            return dict(result) if result else None
+    
 
-# Global database instances
-db_primary = Database('primary')
-db_secondary = Database('secondary')
+
+# Global database instance
+db = Database()
